@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from get_model import get_model
-from dataset import UESTC_Dataset
+from dataset.dataset import UESTC_Dataset
 import copy
 import time
 import math
@@ -45,40 +45,45 @@ def add_weight_noise(model, noise_std=1e-5):
                 param.add_(noise)
 
 
-def train_model(model, dataloaders, criterion, optimizer, scheduler=None, num_epochs=25, patience=7):
+def train_model(model, dataloaders, criterion, optimizer, scheduler=None, num_epochs=25, patience=7, verbose=False):
+    verbose = True
+    """
+    Train model with optimizations including mixed precision training
+    """
     since = time.time()
-
-    train_history = {}
-    train_history['train_acc'] = []
-    train_history['val_acc'] = []
-    train_history['train_loss'] = []
-    train_history['val_loss'] = []
-
+    
+    # Mixed precision training - FIXED deprecated API
+    scaler = torch.amp.GradScaler('cuda')
+    
     best_model_wts = copy.deepcopy(model.state_dict())
     best_acc = 0.0
-    
-    # Early stopping variables
     no_improve_epochs = 0
     early_stop = False
     
-    # Gradient clipping and noise settings
+    # Track training history
+    train_losses = []
+    val_losses = []
+    train_accs = []
+    val_accs = []
+    
+    # Gradient clipping settings
     use_grad_clipping = True
-    use_weight_noise = False  # Enable for more regularization if needed
     max_grad_norm = 1.0
 
     for epoch in range(num_epochs):
         if early_stop:
-            print(f"Early stopping triggered at epoch {epoch}")
+            if verbose:
+                print(f"Early stopping triggered at epoch {epoch}")
             break
             
-        print('Epoch {}/{}'.format(epoch, num_epochs - 1))
-        print('-' * 10)
+        if verbose:
+            print('Epoch {}/{}'.format(epoch, num_epochs - 1))
+            print('-' * 10)
 
         # Each epoch has a training and validation phase
         for phase in ['train', 'val']:
             if phase == 'train':
                 model.train()  # Set model to training mode
-
             else:
                 model.eval()   # Set model to evaluate mode
 
@@ -87,33 +92,37 @@ def train_model(model, dataloaders, criterion, optimizer, scheduler=None, num_ep
 
             # Iterate over data.
             for inputs, labels in dataloaders[phase]:
-                inputs = inputs.to(device)
-                labels = labels.to(device)
+                inputs = inputs.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
 
                 # zero the parameter gradients
                 optimizer.zero_grad()
 
                 # forward
-                # track history if only in train
                 with torch.set_grad_enabled(phase == 'train'):
-                    # Get model outputs and calculate loss
-                    # Special case for inception because in training it has an auxiliary output. In train
-                    #   mode we calculate the loss by summing the final output and the auxiliary output
-                    #   but in testing we only consider the final output.
-                    outputs = model(inputs)
-                    loss = criterion(outputs, labels)
-
-                    _, preds = torch.max(outputs, 1)
-
-                    # backward + optimize only if in training phase
                     if phase == 'train':
-                        loss.backward()
+                        # Mixed precision forward pass - FIXED deprecated API
+                        with torch.amp.autocast('cuda'):
+                            outputs = model(inputs)
+                            loss = criterion(outputs, labels)
+                        
+                        # Mixed precision backward pass
+                        scaler.scale(loss).backward()
                         
                         # Apply gradient clipping
                         if use_grad_clipping:
-                            apply_gradient_clipping(model, max_grad_norm)
+                            scaler.unscale_(optimizer)
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                         
-                        optimizer.step()
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        # Regular forward pass for validation - FIXED deprecated API
+                        with torch.amp.autocast('cuda'):
+                            outputs = model(inputs)
+                            loss = criterion(outputs, labels)
+                    
+                    _, preds = torch.max(outputs, 1)
 
                 # statistics
                 running_loss += loss.item() * inputs.size(0)
@@ -122,47 +131,74 @@ def train_model(model, dataloaders, criterion, optimizer, scheduler=None, num_ep
             epoch_loss = running_loss / len(dataloaders[phase].dataset)
             epoch_acc = running_corrects.double() / len(dataloaders[phase].dataset)
 
-            print('{} Loss: {:.4f} Acc: {:.4f}'.format(phase, epoch_loss, epoch_acc))
+            if phase == 'train':
+                train_losses.append(epoch_loss)
+                train_accs.append(epoch_acc.item())
+            else:
+                val_losses.append(epoch_loss)
+                val_accs.append(epoch_acc.item())
 
-            # if phase == 'train':
-            #     # train_history['train_acc'].append(epoch_acc)
-            #     # train_history['train_loss'].append(epoch_loss)
-            #     # Log to wandb
-            #     wandb.log({"train_loss": epoch_loss, "train_acc": epoch_acc}, step=epoch)
+            if verbose:
+                print('{} Loss: {:.4f} Acc: {:.4f}'.format(phase, epoch_loss, epoch_acc))
 
             # deep copy the model
             if phase == 'val':
-                # train_history['val_acc'].append(epoch_acc)
-                # train_history['val_loss'].append(epoch_loss)
-                # Log to wandb
-                # wandb.log({"val_loss": epoch_loss, "val_acc": epoch_acc}, step=epoch)
-                
                 if epoch_acc > best_acc:
                     best_acc = epoch_acc
                     best_model_wts = copy.deepcopy(model.state_dict())
-                    # Reset early stopping counter when we find a better model
                     no_improve_epochs = 0
                 else:
                     no_improve_epochs += 1
-                    # if no_improve_epochs >= patience:
-                    #     early_stop = True
+                    if no_improve_epochs >= patience:
+                        early_stop = True
                 
                 if scheduler is not None:
                     scheduler.step(epoch_acc)
 
-        print()
+        if verbose:
+            print()
 
     time_elapsed = time.time() - since
-    print('Training complete in {:.0f}m {:.0f}s'.format(time_elapsed // 60, time_elapsed % 60))
-    print('Best val Acc: {:4f}'.format(best_acc))
-    
-    # Log best validation accuracy to wandb
-    # wandb.log({"best_val_acc": best_acc})
+    if verbose:
+        print('Training complete in {:.0f}m {:.0f}s'.format(time_elapsed // 60, time_elapsed % 60))
+        print('Best val Acc: {:4f}'.format(best_acc))
 
     # load best model weights
     model.load_state_dict(best_model_wts)
-    return model, train_history
+    
+    return model, best_acc.item(), time_elapsed, {
+        'train_losses': train_losses,
+        'val_losses': val_losses,
+        'train_accs': train_accs,
+        'val_accs': val_accs
+    }
 
+
+def evaluate_model(model, test_loader, criterion, device):
+    """Evaluate model on test set with mixed precision"""
+    model.eval()
+    running_corrects = 0
+    total_samples = 0
+    running_loss = 0.0
+    
+    with torch.no_grad():
+        for inputs, labels in test_loader:
+            inputs = inputs.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+            
+            with torch.amp.autocast('cuda'):
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
+            
+            _, preds = torch.max(outputs, 1)
+            
+            running_corrects += torch.sum(preds == labels.data)
+            total_samples += labels.size(0)
+            running_loss += loss.item() * labels.size(0)
+    
+    test_acc = running_corrects.double() / total_samples
+    test_loss = running_loss / total_samples
+    return test_acc.item(), test_loss
 
 
 '''
@@ -297,33 +333,72 @@ arg = 0
 # }
 
 # model = create_mamba_linoss_model(**config_info['params'])
-classifier = get_model(arg, model_type="momentum", momentum_beta=0.8, momentum_alpha=1.0).to(device)
+model = get_model(arg, model_type="momentum", momentum_beta=0.2, momentum_alpha=2.5).to(device)
 
-params_to_update = classifier.parameters()
+params_to_update = model.parameters()
 print("Params to learn:")
-for name, param in classifier.named_parameters():
+for name, param in model.named_parameters():
     if param.requires_grad:
         print(f"{name} will be updated")
     else:
         print(f"{name} will not be updated")
 
 
-criterion = torch.nn.CrossEntropyLoss()
+# criterion = torch.nn.CrossEntropyLoss()
 
-# Use lower weight decay with Adam
-weight_decay = 1e-5
-learning_rate = 1e-3
-optimizer_ft = torch.optim.Adam(params_to_update, lr=learning_rate, weight_decay=weight_decay)
+# # Use lower weight decay with Adam
+# weight_decay = 1e-5
+# learning_rate = 1e-3
+# optimizer_ft = torch.optim.Adam(params_to_update, lr=learning_rate, weight_decay=weight_decay)
 
-# Learning rate scheduler with patience tuned for better initialization
-scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer_ft, mode='max', factor=0.6, patience=5, verbose=True)
+# # Learning rate scheduler with patience tuned for better initialization
+# scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer_ft, mode='max', factor=0.6, patience=5, verbose=True)
 
-print("Warming up the model for 10 epochs")
-# Warm up the model for 10 epochs
-classifier, hist = train_model(classifier, dataloaders, criterion, optimizer_ft, scheduler, num_epochs=10, patience=7)
+# print("Warming up the model for 10 epochs")
+# # Warm up the model for 10 epochs
+# classifier, hist = train_model(classifier, dataloaders, criterion, optimizer_ft, scheduler, num_epochs=10, patience=7)
 
-print("Training the model for 40 epochs")
-model_ft, hist = train_model(classifier, dataloaders, criterion, optimizer_ft, scheduler, num_epochs=40, patience=7)
+# print("Training the model for 40 epochs")
+# model_ft, hist = train_model(classifier, dataloaders, criterion, optimizer_ft, scheduler, num_epochs=40, patience=7)
+
+total_params = sum(p.numel() for p in model.parameters())
+trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f"Model parameters: Total={total_params:,}, Trainable={trainable_params:,}")
+
+# Setup optimizer and scheduler - ENHANCED for better performance
+criterion = torch.nn.CrossEntropyLoss(label_smoothing=0.1)  # Label smoothing for better generalization
+momentum_beta = 0.2
+momentum_alpha = 2.5
+# Enhanced optimizer with momentum-aware learning rate
+base_lr = 8e-4 if momentum_beta > 0.8 else 1e-3  # Lower LR for high momentum
+optimizer = torch.optim.AdamW(  # AdamW for better regularization
+    model.parameters(), 
+    lr=base_lr, 
+    weight_decay=1e-4,  # Slightly higher weight decay
+    betas=(0.9, 0.95)   # Optimized beta values
+)
+
+# Enhanced scheduler with warmup
+warmup_scheduler = WarmupLR(optimizer, warmup_epochs=3, base_lr=base_lr)
+main_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer, mode='max', factor=0.65, patience=4, verbose=False, min_lr=1e-6
+)
+
+# Training phase
+print("Warmup training (10 epochs)...")
+model, warmup_val_acc, warmup_time, warmup_history = train_model(
+    model, dataloaders, criterion, optimizer, warmup_scheduler, 
+    num_epochs=10, patience=10, verbose=False
+)
+
+print("Main training (40 epochs)...")
+model, val_acc, train_time, main_history = train_model(
+    model, dataloaders, criterion, optimizer, main_scheduler, 
+    num_epochs=40, patience=10, verbose=False
+)
+
+# Test evaluation
+test_acc, test_loss = evaluate_model(model, dataloaders['test'], criterion, device)
 
 
 
@@ -338,7 +413,7 @@ for inputs, labels in dataloaders[phase]:
     labels = labels.to(device)
 
 
-    outputs = model_ft(inputs)
+    outputs = model(inputs)
     loss = criterion(outputs, labels)
     _, preds = torch.max(outputs, 1)
 
